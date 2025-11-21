@@ -1,0 +1,155 @@
+/****************************************************
+   CLOSED-LOOP CONTROLLED OXYGEN FLOW METER USING SpO2
+   Hardware:
+   - MAX30102 (SpO2 Sensor)
+   - Flow Sensor (YF-S201 or analog flow sensor)
+   - Servo / Proportional Valve
+
+   Author: ChatGPT
+*****************************************************/
+
+#include <Wire.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include <Servo.h>
+
+// ---------- SENSOR OBJECTS ----------
+MAX30105 particleSensor;
+Servo flowValve;
+
+// ---------- PIN DEFINITIONS ----------
+const int flowSensorPin = 2;   // YF-S201 pulse output pin
+const int valvePin      = 9;   // Servo / proportional valve PWM pin
+
+// ---------- GLOBAL VARIABLES ----------
+volatile long pulseCount = 0;
+float flowRate_Lmin = 0;
+
+uint32_t irBuffer[100]; 
+uint32_t redBuffer[100];
+int32_t bufferLength = 100;  
+int32_t spo2 = 0;
+int8_t validSPO2 = 0;
+
+int32_t heartRate;
+int8_t validHeartRate;
+
+unsigned long lastCalcTime = 0;
+
+// ---------- CONTROL PARAMETERS ----------
+float targetSpO2 = 95.0;   // desired SpO₂ threshold
+int valvePosition = 60;    // default valve opening (0–180)
+int maxValvePos   = 170;
+int minValvePos   = 20;
+
+// ===================================================
+//                 FLOW SENSOR ISR
+// ===================================================
+void flowPulse() {
+  pulseCount++;
+}
+
+// ===================================================
+//                 SETUP
+// ===================================================
+void setup() {
+  Serial.begin(115200);
+
+  // Servo setup
+  flowValve.attach(valvePin);
+  flowValve.write(valvePosition);
+
+  // Flow sensor setup
+  pinMode(flowSensorPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(flowSensorPin), flowPulse, RISING);
+
+  // MAX30102 setup
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found!");
+    while (1);
+  }
+
+  particleSensor.setup();  
+  particleSensor.setPulseAmplitudeRed(0x0A);
+  particleSensor.setPulseAmplitudeIR(0x0A);
+
+  Serial.println("System Ready...");
+}
+
+// ===================================================
+//         FUNCTION TO READ FLOW (YF-S201 TYPE)
+// ===================================================
+float readFlowSensor() {
+  pulseCount = 0;
+  delay(1000);  // count pulses for 1 sec
+  float frequency = pulseCount;       
+  float flow_Lmin = frequency / 7.5;  
+  return flow_Lmin;
+}
+
+// ===================================================
+//            READ SpO2 USING MAX30102
+// ===================================================
+int readSpO2() {
+
+  for (int i = 0; i < bufferLength; i++) {
+    while (particleSensor.available() == false)
+      particleSensor.check();
+
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i]  = particleSensor.getIR();
+    particleSensor.nextSample();
+  }
+
+  // Run SpO2 calculation
+  maxim_heart_rate_and_oxygen_saturation(
+    irBuffer, bufferLength, redBuffer,
+    &spo2, &validSPO2, &heartRate, &validHeartRate
+  );
+
+  return spo2;
+}
+
+// ===================================================
+//      CLOSED-LOOP CONTROL BASED ON SpO₂
+// ===================================================
+void closedLoopControl(int currentSpO2) {
+
+  if (currentSpO2 < 88 && currentSpO2 > 70) {
+    valvePosition += 15;   // severe hypoxia → large increase
+  }
+  else if (currentSpO2 < targetSpO2) {
+    valvePosition += 5;    // moderate correction
+  }
+  else if (currentSpO2 > (targetSpO2 + 2)) {
+    valvePosition -= 5;    // reduce oxygen if high
+  }
+
+  // Limit valve range
+  valvePosition = constrain(valvePosition, minValvePos, maxValvePos);
+  flowValve.write(valvePosition);
+}
+
+// ===================================================
+//                    MAIN LOOP
+// ===================================================
+void loop() {
+
+  // Read oxygen flow
+  flowRate_Lmin = readFlowSensor();
+
+  // Read SpO₂
+  int currentSpO2 = readSpO2();
+
+  // Closed-loop control
+  closedLoopControl(currentSpO2);
+
+  // Print data
+  Serial.print("SpO2: ");
+  Serial.print(currentSpO2);
+  Serial.print(" %   Flow: ");
+  Serial.print(flowRate_Lmin);
+  Serial.print(" L/min   Valve: ");
+  Serial.println(valvePosition);
+}
+gh
